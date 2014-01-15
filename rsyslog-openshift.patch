@@ -1,0 +1,62 @@
+diff --git a/Makefile.am b/Makefile.am
+index 567b876..98956ff 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -241,6 +241,10 @@ if ENABLE_MMANON
+ SUBDIRS += plugins/mmanon
+ endif
+ 
++if ENABLE_MMOPENSHIFT
++SUBDIRS += plugins/mmopenshift
++endif
++
+ if ENABLE_ORACLE
+ SUBDIRS += plugins/omoracle
+ endif
+diff --git a/configure.ac b/configure.ac
+index d2a8891..c220dc1 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -964,6 +964,26 @@ AC_ARG_ENABLE(mmanon,
+ AM_CONDITIONAL(ENABLE_MMANON, test x$enable_mmanon = xyes)
+ 
+ 
++# mmopenshift
++AC_ARG_ENABLE(mmopenshift,
++        [AS_HELP_STRING([--enable-mmopenshift],[Enable building mmopenshift support @<:@default=no@:>@])],
++        [case "${enableval}" in
++         yes) enable_mmopenshift="yes" ;;
++          no) enable_mmopenshift="no" ;;
++           *) AC_MSG_ERROR(bad value ${enableval} for --enable-mmopenshift) ;;
++         esac],
++        [enable_mmopenshift=no]
++)
++if test "x$enable_openshift" = "xyes"; then
++  AC_CHECK_HEADERS(
++    [sys/inotify.h],,
++    [AC_MSG_FAILURE([sys/inotify.h is missing])]
++  )
++  AC_CHECK_FUNCS(inotify_init)
++fi
++AM_CONDITIONAL(ENABLE_MMOPENSHIFT, test x$enable_mmopenshift = xyes)
++
++
+ # RELP support
+ AC_ARG_ENABLE(relp,
+         [AS_HELP_STRING([--enable-relp],[Enable RELP support @<:@default=no@:>@])],
+@@ -1480,6 +1500,7 @@ AC_CONFIG_FILES([Makefile \
+ 		plugins/mmjsonparse/Makefile \
+ 		plugins/mmaudit/Makefile \
+ 		plugins/mmanon/Makefile \
++		plugins/mmopenshift/Makefile \
+ 		plugins/omelasticsearch/Makefile \
+ 		plugins/sm_cust_bindcdr/Makefile \
+ 		plugins/mmsnmptrapd/Makefile \
+@@ -1541,6 +1562,7 @@ echo "    mmnormalize module will be compiled:      $enable_mmnormalize"
+ echo "    mmjsonparse module will be compiled:      $enable_mmjsonparse"
+ echo "    mmjaduit module will be compiled:         $enable_mmaudit"
+ echo "    mmsnmptrapd module will be compiled:      $enable_mmsnmptrapd"
++echo "    mmopenshift module will be compiled:      $enable_mmopenshift"
+ echo
+ echo "---{ strgen modules }---"
+ echo "    sm_cust_bindcdr module will be compiled:  $enable_sm_cust_bindcdr"
