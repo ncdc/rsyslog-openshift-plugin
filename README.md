@@ -2,7 +2,7 @@
 OpenShift metadata message modification module for rsyslog. This plugin adds information about the OpenShift container to the message.
 
 # Installing rsyslog-openshift
-Requires the new (v6+) configuration file format. Tested with rsyslog-7.4.3
+Requires the new (v6+) configuration file format. Tested with the v7-stable branch of rsyslog from GitHub.
 
 1. Apply the patch 'rsyslog-openshift.patch' to the source of rsyslog:
 
@@ -18,8 +18,35 @@ Requires the new (v6+) configuration file format. Tested with rsyslog-7.4.3
 1. Specify `--enable-mmopenshift` when running `configure`
 1. make && make install
 
-# Configuration
-TODO
+# Sample Configuration
+
+        module(load="imuxsock" SysSock.Annotate="on" SysSock.ParseTrusted="on" SysSock.UsePIDFromSystem="on")
+
+        template(name="OpenShift" type="list") {
+                property(name="timestamp" dateFormat="rfc3339")
+                constant(value=" ")
+                property(name="hostname")
+                constant(value=" ")
+                property(name="syslogtag")
+                constant(value=" app=")
+                property(name="$!OpenShift!AppUuid")
+                constant(value=" gear=")
+                property(name="$!OpenShift!GearUuid")
+                constant(value=" ns=")
+                property(name="$!OpenShift!Namespace")
+                property(name="msg" spifno1stsp="on")
+                property(name="msg" droplastlf="on")
+                constant(value="\n")
+        }
+
+        module(load="mmopenshift")
+        if $!OpenShift!AppUuid != '' then
+          *.* action(type="omfile" file="/var/log/openshift_gears" template="OpenShift")
+        else {
+          *.info;mail.none;authpriv.none;cron.none      action(type="omfile" file="/var/log/messages")
+          ...
+        }
+
 
 # License
 Copyright 2014 Red Hat, Inc.
