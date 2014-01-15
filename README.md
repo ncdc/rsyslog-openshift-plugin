@@ -1,7 +1,31 @@
-# rsyslog-openshift
+# rsyslog-openshift-plugin
 OpenShift metadata message modification module for rsyslog. This plugin adds information about the OpenShift container to the message.
 
-# Installing rsyslog-openshift
+This plugin only works if the message has the $!uid JSON property, which can be added automatically via the imuxsock plugin by turning on the following 3 options:
+
+- SysSock.UsePIDFromSystem
+- SysSock.ParseTrusted
+- SysSock.Annotate
+
+# Operation
+This plugin examines each message's $!uid JSON property. If the property exists and is greater than or equal to gearUidStart, the plugin will attempt to retrieve the following metadata for the gear:
+
+- OPENSHIFT_GEAR_UUID
+- OPENSHIFT_APP_UUID
+- OPENSHIFT_NAMESPACE
+
+The plugin will create the $!OpenShift subtree in the message's JSON and add the following keys:
+
+- $!OpenShift!GearUuid
+- $!OpenShift!AppUuid
+- $!OpenShift!Namespace
+
+# Configuration
+**gearUidStart** - the first user ID to be used for OpenShift gears (default: 1000)
+
+**gearBaseDir** - the base directory where OpenShift gears reside (default: /var/lib/openshift)
+
+# Installing the plugin
 Requires the new (v6+) configuration file format. Tested with the v7-stable branch of rsyslog from GitHub.
 
 1. Apply the patch 'rsyslog-openshift.patch' to the source of rsyslog:
