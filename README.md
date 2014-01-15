@@ -6,14 +6,14 @@ Requires the new (v6+) configuration file format. Tested with rsyslog-7.4.3
 
 1. Apply the patch 'rsyslog-openshift.patch' to the source of rsyslog:
 
-    cd path/to/rsyslog
-    patch -p1 -i rsyslog-openshift.patch
+        cd path/to/rsyslog
+        patch -p1 -i rsyslog-openshift.patch
 
 1. Copy the mmopenshift directory to rsyslog's plugins directory.
 1. Update autotools files:
 
-    cd path/to/rsyslog
-    autoreconf
+        cd path/to/rsyslog
+        autoreconf
 
 1. Specify `--enable-mmopenshift` when running `configure`
 1. make && make install
