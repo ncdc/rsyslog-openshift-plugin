@@ -54,6 +54,7 @@ static es_str_t* es_uid = NULL;
 
 typedef struct _instanceData {
   uid_t gearUidStart;
+  char* gearBaseDir;
   struct hashtable *uidMap;
   struct hashtable *uuidMap;
   pthread_t watchThread;
@@ -102,7 +103,7 @@ uuidHash(void* k)
   unsigned int hash = 5381;
   int c;
 
-  while (c = *str++) {
+  while ((c = *str++)) {
     hash = ((hash << 5) + hash) + c; // hash * 33 + c
   }
 
@@ -121,47 +122,18 @@ uuidValueDestroy(void* value) {
 }
 
 
-
-struct modConfData_s {
-	rsconf_t *pConf;	/* our overall config object */
-};
-static modConfData_t *loadModConf = NULL;/* modConf ptr to use for the current load process */
-static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current exec process */
-
-
 /* tables for interfacing with the v6 config system */
 /* action (instance) parameters */
 static struct cnfparamdescr actpdescr[] = {
 	{ "gearuidstart", eCmdHdlrPositiveInt, 0 },
+	{ "gearbasedir", eCmdHdlrGetWord, 0 },
 };
+
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
 	  actpdescr
 	};
-
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-	pModConf->pConf = pConf;
-ENDbeginCnfLoad
-
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-ENDendCnfLoad
-
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-
-BEGINactivateCnf
-CODESTARTactivateCnf
-	runModConf = pModConf;
-ENDactivateCnf
-
-BEGINfreeCnf
-CODESTARTfreeCnf
-ENDfreeCnf
 
 
 BEGINcreateInstance
@@ -182,7 +154,6 @@ CODESTARTfreeInstance
 
   pthread_mutex_lock(&pData->lock);
 
-  //TODO check rc
   // free uidMap hashtable
   if(pData->uidMap != NULL) {
     hashtable_destroy(pData->uidMap, 1);
@@ -195,8 +166,21 @@ CODESTARTfreeInstance
 
   pthread_mutex_unlock(&pData->lock);
 
-  rc = pthread_mutex_destroy(&pData->lock);
-  //TODO check rc
+  pthread_mutex_destroy(&pData->lock);
+
+  if(pData->inotifyFd != -1) {
+    close(pData->inotifyFd);
+  }
+
+  if(pData->pipeFds[0] != -1) {
+    close(pData->pipeFds[0]);
+  }
+
+  if(pData->pipeFds[1] != -1) {
+    close(pData->pipeFds[1]);
+  }
+
+  free(pData->gearBaseDir);
 ENDfreeInstance
 
 
@@ -205,6 +189,10 @@ setInstParamDefaults(instanceData *pData)
 {
 	pData->gearUidStart = 1000;
 	pData->watchThreadRunning = 1;
+
+	// use strdup here so we can free this var later
+	// regardless of if it was the default or user specified
+	pData->gearBaseDir = strdup("/var/lib/openshift");
 }
 
 static void watchThread(instanceData* pData) {
@@ -299,6 +287,8 @@ CODESTARTnewActInst
     }
 		if(!strcmp(actpblk.descr[i].name, "gearuidstart")) {
 		  pData->gearUidStart = (uid_t)pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "gearbasedir")) {
+			pData->gearBaseDir = es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else {
 			dbgprintf("mmopenshift: program error, non-handled "
 			  "param '%s'\n", actpblk.descr[i].name);
@@ -325,7 +315,7 @@ CODESTARTnewActInst
 		ABORT_FINALIZE(RS_RET_ERR);
   }
 
-  pData->inotifyWatchFd = inotify_add_watch(pData->inotifyFd, "/var/lib/openshift", IN_DELETE);
+  pData->inotifyWatchFd = inotify_add_watch(pData->inotifyFd, pData->gearBaseDir, IN_DELETE);
   if(-1 == pData->inotifyWatchFd) {
 		errmsg.LogError(0, RS_RET_ERR, "error: could not add inotify watch");
 		ABORT_FINALIZE(RS_RET_ERR);
@@ -357,24 +347,24 @@ BEGINtryResume
 CODESTARTtryResume
 ENDtryResume
 
-static char* readOpenShiftEnvVar(char* gearUuid, char* varName) {
+static char* readOpenShiftEnvVar(char* gearBaseDir, char* gearUuid, char* varName) {
   rsRetVal iRet = RS_RET_OK;
+  char* data = NULL;
 
   // using snprintf this way, it will return the # of bytes needed to store
   // the entire formatting string (excluding the null terminator)
-  size_t needed = snprintf(NULL, 0, "/var/lib/openshift/%s/.env/%s", gearUuid, varName) + 1;
+  size_t needed = snprintf(NULL, 0, "%s/%s/.env/%s", gearBaseDir, gearUuid, varName) + 1;
 
   char* filename;
-  CHKmalloc(filename = malloc(needed));
-  snprintf(filename, needed, "/var/lib/openshift/%s/.env/%s", gearUuid, varName);
+  CHKmalloc(filename = MALLOC(needed));
+  snprintf(filename, needed, "%s/%s/.env/%s", gearBaseDir, gearUuid, varName);
 
   FILE* fp = fopen(filename, "r");
 
   off_t size = 0;
   CHKiRet(getFileSize((uchar*)filename, &size));
 
-  char* data = NULL;
-  CHKmalloc(data = malloc(size));
+  CHKmalloc(data = MALLOC(size));
 
   if(fgets(data, size, fp) == NULL) {
     // there was an error reading the file
@@ -425,7 +415,7 @@ CODESTARTdoAction
       DBGPRINTF("mmopenshift: key not found\n");
 
       DBGPRINTF("mmopenshift: alloc for gearInfo\n");
-      CHKmalloc(gear = malloc(sizeof(gearInfo)));
+      CHKmalloc(gear = MALLOC(sizeof(gearInfo)));
 
       DBGPRINTF("mmopenshift: getpwuid\n");
       struct passwd* pwdata = getpwuid(uid);
@@ -433,12 +423,12 @@ CODESTARTdoAction
       gearUuid = pwdata->pw_name;
 
       //NOTE: readOpenShiftEnvVar returns memory that was malloc'd
-      appUuid = readOpenShiftEnvVar(gearUuid, "OPENSHIFT_APP_UUID");
-      namespace = readOpenShiftEnvVar(gearUuid, "OPENSHIFT_NAMESPACE");
+      appUuid = readOpenShiftEnvVar(pData->gearBaseDir, gearUuid, "OPENSHIFT_APP_UUID");
+      namespace = readOpenShiftEnvVar(pData->gearBaseDir, gearUuid, "OPENSHIFT_NAMESPACE");
 
       // fill in the gearInfo data
       // gearUuid
-      CHKmalloc(gear->gearUuid = malloc(strlen(gearUuid) + 1));
+      CHKmalloc(gear->gearUuid = MALLOC(strlen(gearUuid) + 1));
       strcpy(gear->gearUuid, gearUuid);
 
       // appUuid
@@ -453,7 +443,7 @@ CODESTARTdoAction
 
       // allocate memory for the key (uid)
       uid_t* keybuf;
-      CHKmalloc(keybuf = malloc(sizeof(uid_t)));
+      CHKmalloc(keybuf = MALLOC(sizeof(uid_t)));
       *keybuf = uid;
 
       DBGPRINTF("mmopenshift: adding to hash\n");
@@ -468,17 +458,18 @@ CODESTARTdoAction
       namespace = gear->namespace;
     }
 
-    // reset pJson to point at the root of the message's json object
-    pJson = pMsg->json;
+    pJson = json_object_new_object();
 
     jval = json_object_new_string(appUuid);
-    json_object_object_add(pJson, "appUuid", jval);
+    json_object_object_add(pJson, "AppUuid", jval);
 
     jval = json_object_new_string(gearUuid);
-    json_object_object_add(pJson, "gearUuid", jval);
+    json_object_object_add(pJson, "GearUuid", jval);
 
     jval = json_object_new_string(namespace);
-    json_object_object_add(pJson, "appNamespace", jval);
+    json_object_object_add(pJson, "Namespace", jval);
+
+    json_object_object_add(pMsg->json, "OpenShift", pJson);
   }
 finalize_it:
 ENDdoAction
@@ -507,7 +498,6 @@ BEGINqueryEtryPt
 CODESTARTqueryEtryPt
 CODEqueryEtryPt_STD_OMOD_QUERIES
 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
 ENDqueryEtryPt
 
 
