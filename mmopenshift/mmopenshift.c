@@ -40,6 +40,7 @@
 #include "module-template.h"
 #include "errmsg.h"
 #include "hashtable.h"
+#include "hashtable_itr.h"
 
 MODULE_TYPE_OUTPUT
 MODULE_TYPE_NOKEEP
@@ -52,25 +53,28 @@ DEF_OMOD_STATIC_DATA
 /* module global variables */
 static es_str_t* es_uid = NULL;
 
-typedef struct _instanceData {
-  uid_t gearUidStart;
-  char* gearBaseDir;
-  struct hashtable *uidMap;
-  struct hashtable *uuidMap;
-  pthread_t watchThread;
-  int watchThreadRunning;
-  pthread_mutex_t lock;
-  int pipeFds[2];
-  int inotifyFd;
-  int inotifyWatchFd;
-} instanceData;
-
 // uid -> gearInfo
 typedef struct _gearInfo {
   char* appUuid;
   char* gearUuid;
   char* namespace;
+  struct _gearInfo* next;
 } gearInfo;
+
+typedef struct _instanceData {
+  uid_t gearUidStart;
+  char* gearBaseDir;
+  unsigned int maxCacheSize;
+  gearInfo* oldestGearInfo;
+  gearInfo* newestGearInfo;
+  struct hashtable *uidMap;
+  struct hashtable *uuidMap;
+  pthread_t watchThread;
+  pthread_mutex_t lock;
+  int pipeFds[2];
+  int inotifyFd;
+  int inotifyWatchFd;
+} instanceData;
 
 static unsigned int
 uidHash(void *k)
@@ -100,14 +104,14 @@ uuidHash(void* k)
   char* str = (char*)k;
 
   //djb2
-  unsigned int hash = 5381;
+  unsigned int hashValue = 5381;
   int c;
 
   while ((c = *str++)) {
-    hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    hashValue = ((hashValue << 5) + hashValue) + c; // hashValue * 33 + c
   }
 
-  return hash;
+  return hashValue;
 }
 
 static int
@@ -127,6 +131,7 @@ uuidValueDestroy(void* value) {
 static struct cnfparamdescr actpdescr[] = {
 	{ "gearuidstart", eCmdHdlrPositiveInt, 0 },
 	{ "gearbasedir", eCmdHdlrGetWord, 0 },
+	{ "maxcachesize", eCmdHdlrPositiveInt, 0 },
 };
 
 static struct cnfparamblk actpblk =
@@ -188,7 +193,9 @@ static inline void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->gearUidStart = 1000;
-	pData->watchThreadRunning = 1;
+	pData->maxCacheSize = 100;
+	pData->newestGearInfo = NULL;
+	pData->oldestGearInfo = NULL;
 
 	// use strdup here so we can free this var later
 	// regardless of if it was the default or user specified
@@ -262,8 +269,6 @@ static void watchThread(instanceData* pData) {
       }
     }
   }
-
-  pData->watchThreadRunning = 0;
 }
 
 BEGINnewActInst
@@ -289,6 +294,8 @@ CODESTARTnewActInst
 		  pData->gearUidStart = (uid_t)pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "gearbasedir")) {
 			pData->gearBaseDir = es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, "maxcachesize")) {
+			pData->maxCacheSize = (int)pvals[i].val.d.n;
 		} else {
 			dbgprintf("mmopenshift: program error, non-handled "
 			  "param '%s'\n", actpblk.descr[i].name);
@@ -339,7 +346,32 @@ ENDnewActInst
 
 
 BEGINdbgPrintInstInfo
+  struct hashtable_itr* iter;
 CODESTARTdbgPrintInstInfo
+  DBGPRINTF("mmopenshift\n");
+  DBGPRINTF("\tgearUidStart=%d\n", pData->gearUidStart);
+  DBGPRINTF("\tgearBaseDir=%s\n", pData->gearBaseDir);
+  DBGPRINTF("\tmaxCacheSize=%d\n", pData->maxCacheSize);
+  if(pData->oldestGearInfo != NULL) {
+    DBGPRINTF("\toldest gear uuid=%s\n", pData->oldestGearInfo->gearUuid);
+  }
+  if(pData->newestGearInfo != NULL) {
+    DBGPRINTF("\tnewest gear uuid=%s\n", pData->newestGearInfo->gearUuid);
+  }
+  if(pData->uidMap != NULL && hashtable_count(pData->uidMap) > 0) {
+    DBGPRINTF("\tuidMap keys\n");
+    iter = hashtable_iterator(pData->uidMap);
+    do {
+      DBGPRINTF("\t\t%d\n", *(uid_t*)hashtable_iterator_key(iter));
+    } while(hashtable_iterator_advance(iter));
+  }
+  if(pData->uuidMap != NULL && hashtable_count(pData->uuidMap) > 0) {
+    DBGPRINTF("\tuuidMap keys\n");
+    iter = hashtable_iterator(pData->uuidMap);
+    do {
+      DBGPRINTF("\t\t%s\n", (char*)hashtable_iterator_key(iter));
+    } while(hashtable_iterator_advance(iter));
+  }
 ENDdbgPrintInstInfo
 
 
@@ -385,6 +417,7 @@ BEGINdoAction
 	rsRetVal localRet;
 	uid_t uid;
 	gearInfo* gear;
+	gearInfo* gearToDelete = NULL;
 	char* appUuid;
 	char* gearUuid;
 	char* namespace;
@@ -446,9 +479,50 @@ CODESTARTdoAction
       CHKmalloc(keybuf = MALLOC(sizeof(uid_t)));
       *keybuf = uid;
 
-      DBGPRINTF("mmopenshift: adding to hash\n");
+      // first entry, set oldest pointer
+      if(NULL == pData->oldestGearInfo) {
+        pData->oldestGearInfo = gear;
+      }
+
+      // set newest->next pointer
+      if(pData->newestGearInfo != NULL) {
+        pData->newestGearInfo->next = gear;
+      }
+
+      // update newest pointer
+      pData->newestGearInfo = gear;
+
+      // see if we're at capacity and need to delete the oldest entry
+      if(hashtable_count(pData->uidMap) >= pData->maxCacheSize) {
+        DBGPRINTF("mmopenshift: cache is full - need to delete oldest entry\n");
+        gearToDelete = pData->oldestGearInfo;
+        //dbgPrintInstInfo(pData);
+      }
+
+      //LOCK
       pthread_mutex_lock(&pData->lock);
+
+      // delete the oldest entry if necessary
+      if(gearToDelete != NULL) {
+        // update oldest entry pointer
+        pData->oldestGearInfo = pData->oldestGearInfo->next;
+
+        DBGPRINTF("mmopenshift: removing %s from uuid map\n", gearToDelete->gearUuid);
+        uid_t* uidToDelete = hashtable_remove(pData->uuidMap, gearToDelete->gearUuid);
+        if(uidToDelete != NULL) {
+          DBGPRINTF("mmopenshift: removing %d from uid map\n", *uidToDelete);
+          hashtable_remove(pData->uidMap, uidToDelete);
+        }
+      }
+
+      DBGPRINTF("mmopenshift: adding to hash\n");
       hashtable_insert(pData->uidMap, keybuf, gear);
+
+      CHKmalloc(keybuf = MALLOC(sizeof(uid_t)));
+      *keybuf = uid;
+      hashtable_insert(pData->uuidMap, strdup(gearUuid), keybuf);
+
+      //UNLOCK
       pthread_mutex_unlock(&pData->lock);
     } else {
       DBGPRINTF("mmopenshift: found key in hash\n");
