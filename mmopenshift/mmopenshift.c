@@ -53,41 +53,97 @@ DEF_OMOD_STATIC_DATA
 /* module global variables */
 static es_str_t* es_uid = NULL;
 
-// uid -> gearInfo
+
+// struct to hold OpenShift metadata
 typedef struct _gearInfo {
+  // OpenShift application UUID
   char* appUuid;
+
+  // OpenShift gear UUID
   char* gearUuid;
+
+  // OpenShift application domain
   char* namespace;
+
+  // pointer to next oldest gearInfo
+  // used during FIFO eviction if the cache gets full
   struct _gearInfo* next;
 } gearInfo;
 
+
+// struct to hold plugin instance data
 typedef struct _instanceData {
+  // minimum uid value for OpenShift gears
   uid_t gearUidStart;
+
+  // base directory where OpenShift gears are stored
   char* gearBaseDir;
+
+  // maximum number of items to keep in the gear info cache
   unsigned int maxCacheSize;
+
+  // oldest gear info entry (by time of addition)
   gearInfo* oldestGearInfo;
+
+  // newest gear info entry (by time of addition)
   gearInfo* newestGearInfo;
+
+  // map from uid to gearInfo
   struct hashtable *uidMap;
+
+  // map from uuid to uid (needed for deletion)
   struct hashtable *uuidMap;
+
+  // thread for using inotify to watch for gear directory deletions
   pthread_t watchThread;
+
+  // mutex to use for thread safety when modifying the 2 maps
   pthread_mutex_t lock;
+
+  // file descriptors for a pipe so we can signal the inotify thread to stop
   int pipeFds[2];
+
+  // inotify file descriptor
   int inotifyFd;
+
+  // inotify watch descriptor
   int inotifyWatchFd;
 } instanceData;
 
+/**
+ * Hash function for the uid->gearInfo map
+ *
+ * Key type is uid_t
+ *
+ * Simplistic implementation just uses the value of the uid as the hash value
+ */
 static unsigned int
 uidHash(void *k)
 {
 	return((unsigned) *((uid_t*) k));
 }
 
+/**
+ * Key equality function for the uid->gearInfo map
+ *
+ * 2 keys are equal if the values they point to (of type uid_t) are identical
+ */
 static int
 uidKeyEquals(void *key1, void *key2)
 {
 	return *((uid_t*) key1) == *((uid_t*) key2);
 }
 
+/**
+ * Value "destructor" function for the uid->gearInfo map
+ *
+ * Invoked when a key is removed from the uidMap.
+ *
+ * Value type is gearInfo.
+ *
+ * Frees the memory we previously allocated in the gearInfo struct as well as
+ * the struct itself.
+ */
 static void
 uidValueDestroy(void* value) {
   gearInfo* gi = (gearInfo*)value;
@@ -97,13 +153,20 @@ uidValueDestroy(void* value) {
   free(gi);
 }
 
-// uuid -> uid
+/**
+ * Hash function for the uuid->uid map
+ *
+ * Key type is char* (gear UUID)
+ *
+ * Implements the djb2 hash function
+ *
+ * See http://www.cse.yorku.ca/~oz/hash.html for more details
+ */
 static unsigned int
 uuidHash(void* k)
 {
   char* str = (char*)k;
 
-  //djb2
   unsigned int hashValue = 5381;
   int c;
 
@@ -114,12 +177,22 @@ uuidHash(void* k)
   return hashValue;
 }
 
+/**
+ * Key equality function for the uuid->uid map
+ *
+ * 2 keys are equal if strcmp returns 0 (string equality)
+ */
 static int
 uuidKeyEquals(void *key1, void *key2)
 {
 	return !strcmp((char*)key1, (char*)key2);
 }
 
+/**
+ * Value "destructor" function for the uuid->uid map
+ *
+ * Simply frees the value
+ */
 static void
 uuidValueDestroy(void* value) {
   free(value);
@@ -153,10 +226,11 @@ ENDisCompatibleWithFeature
 
 BEGINfreeInstance
 CODESTARTfreeInstance
-  // shut down inotify thread
+  // shut down inotify thread by writing 1 character to the write end of the pipe fd pair
   int rc = -1;
   rc = write(pData->pipeFds[1], "x", 1);
 
+  // lock the mutex for the 2 maps
   pthread_mutex_lock(&pData->lock);
 
   // free uidMap hashtable
@@ -169,31 +243,47 @@ CODESTARTfreeInstance
     hashtable_destroy(pData->uuidMap, 1);
   }
 
+  // unlock the mutex
   pthread_mutex_unlock(&pData->lock);
 
+  // destroy it
   pthread_mutex_destroy(&pData->lock);
 
   if(pData->inotifyFd != -1) {
+    // close the inotify fd
     close(pData->inotifyFd);
   }
 
   if(pData->pipeFds[0] != -1) {
+    // close the read end of the pipe fd pair
     close(pData->pipeFds[0]);
   }
 
   if(pData->pipeFds[1] != -1) {
+    // close the write end of the pipe fd pair
     close(pData->pipeFds[1]);
   }
 
+  // need to free gearBaseDir as it either has the default value which we
+  // got via strdup(), or it came from the config system, and it's up to us
+  // to free in that case too
   free(pData->gearBaseDir);
 ENDfreeInstance
 
 
+/**
+ * Set defaults for the plugin instance
+ */
 static inline void
 setInstParamDefaults(instanceData *pData)
 {
+	// OpenShift usually starts gears at uid 1000
 	pData->gearUidStart = 1000;
+
+	// keep up to 100 gears in the cache
 	pData->maxCacheSize = 100;
+
+	// no gears yet
 	pData->newestGearInfo = NULL;
 	pData->oldestGearInfo = NULL;
 
@@ -202,23 +292,39 @@ setInstParamDefaults(instanceData *pData)
 	pData->gearBaseDir = strdup("/var/lib/openshift");
 }
 
+/**
+ * This method runs in a separate thread and is used to remove entries from
+ * the uidMap and uuidMap caches when a gear is deleted from a node.
+ *
+ * Monitor the gear base directory for directory deletions via inotify, and attempt to
+ * evict the appropriate entry from the caches using the directory name
+ * as the key into the uuidMap, since the directory name should be the gear UUID.
+ */
 static void watchThread(instanceData* pData) {
   // size the buffer to hold 1 struct + a filename of 50 chars + \0
   size_t bufferSize = sizeof(struct inotify_event) + 51;
+
   // the buffer we'll use to hold the inotify struct
   char buffer[bufferSize];
+
   // the event pointer we'll be working with
   struct inotify_event *event;
+
   // file descriptors we'll be reading from
   fd_set readFds;
+
   int rc = 0;
   int done = 0;
   int count = 0;
+
+  // loop until we're notified to stop via the pipe fd
   while(!done) {
     // clear out the file descriptor set
     FD_ZERO(&readFds);
+
     // add the inotify file descriptor
     FD_SET(pData->inotifyFd, &readFds);
+
     // add the pipe file descriptor (so we can receive notification to stop)
     FD_SET(pData->pipeFds[0], &readFds);
 
@@ -226,7 +332,11 @@ static void watchThread(instanceData* pData) {
     // don't set a timeout as we'll be using the pipe to exit
     rc = select(FD_SETSIZE, &readFds, NULL, NULL, NULL);
     if (rc == -1) {
-      // TODO error
+      // TODO need to figure out what to do here:
+      //
+      // do we bail entirely and try to shut down the plugin instance?
+      //
+      // do we just log the error and ignore it, hoping it was a fluke?
     } else {
       if(FD_ISSET(pData->pipeFds[0], &readFds)) {
         // the pipe had data on it, which means we're ready to shut down
@@ -264,12 +374,21 @@ static void watchThread(instanceData* pData) {
             }
           }
         } else {
-          // TODO error
+          // TODO need to figure what to do here:
+          //
+          // if the inotify fd is ready to read but we weren't able to do so,
+          // does it mean our buffer was too small, or did something else prevent
+          // the read from succeeding?
+          //
+          // if count is 0 that means "EOF"
+          //
+          // if count is -1 that means error
         }
       }
     }
   }
 }
+
 
 BEGINnewActInst
 	struct cnfparamvals *pvals;
@@ -281,11 +400,13 @@ CODESTARTnewActInst
 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
 	}
 
+  // follow conventions from other plugins
 	CODE_STD_STRING_REQUESTnewActInst(1)
 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
 	CHKiRet(createInstance(&pData));
 	setInstParamDefaults(pData);
 
+	// check for config params specified in the config file
 	for(i = 0 ; i < actpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed) {
 			continue;
@@ -302,38 +423,45 @@ CODESTARTnewActInst
 		}
 	}
 
+  // create the uid->gearInfo map
 	pData->uidMap = create_hashtable(100, uidHash, uidKeyEquals, uidValueDestroy);
 	if(NULL == pData->uidMap) {
 		errmsg.LogError(0, RS_RET_ERR, "error: could not create uidMap, cannot activate action");
 		ABORT_FINALIZE(RS_RET_ERR);
   }
 
+  // create the uuid->uid map
 	pData->uuidMap = create_hashtable(100, uuidHash, uuidKeyEquals, uuidValueDestroy);
 	if(NULL == pData->uidMap) {
 		errmsg.LogError(0, RS_RET_ERR, "error: could not create uuidMap, cannot activate action");
 		ABORT_FINALIZE(RS_RET_ERR);
   }
 
+  // create the pipe which we'll use to signal the inotify thread to stop
   pipe(pData->pipeFds);
 
+  // set up inotify
   pData->inotifyFd = inotify_init();
   if(-1 == pData->inotifyFd) {
 		errmsg.LogError(0, RS_RET_ERR, "error: could not initialize inotify");
 		ABORT_FINALIZE(RS_RET_ERR);
   }
 
+  // watch for deletions in the gear base dir
   pData->inotifyWatchFd = inotify_add_watch(pData->inotifyFd, pData->gearBaseDir, IN_DELETE);
   if(-1 == pData->inotifyWatchFd) {
 		errmsg.LogError(0, RS_RET_ERR, "error: could not add inotify watch");
 		ABORT_FINALIZE(RS_RET_ERR);
   }
 
+  // set up our mutex
   rc = pthread_mutex_init(&pData->lock, NULL);
   if(rc != 0) {
 		errmsg.LogError(0, RS_RET_ERR, "error: could not create mutex, rc=%d", rc);
 		ABORT_FINALIZE(RS_RET_ERR);
   }
 
+  // create the inotify watch thread
   rc = pthread_create(&pData->watchThread, NULL, (void*)&watchThread, pData);
   if(rc != 0) {
 		errmsg.LogError(0, RS_RET_ERR, "error: could not create thread, rc=%d", rc);
@@ -379,6 +507,15 @@ BEGINtryResume
 CODESTARTtryResume
 ENDtryResume
 
+
+/**
+ * Helper method to read an OpenShift environment variable file
+ *
+ * Reads $gearBaseDir/$gearUuid/.env/$varName and returns it as a char*
+ *
+ * The returned char* is malloc'd here and it is the responsibility of the
+ * caller to free it later.
+ */
 static char* readOpenShiftEnvVar(char* gearBaseDir, char* gearUuid, char* varName) {
   rsRetVal iRet = RS_RET_OK;
   char* data = NULL;
@@ -396,6 +533,9 @@ static char* readOpenShiftEnvVar(char* gearBaseDir, char* gearUuid, char* varNam
   off_t size = 0;
   CHKiRet(getFileSize((uchar*)filename, &size));
 
+  // no longer needed, so free it
+  free(filename);
+
   CHKmalloc(data = MALLOC(size));
 
   if(fgets(data, size, fp) == NULL) {
@@ -411,16 +551,21 @@ finalize_it:
 }
 
 
+/**
+ * This is the main message processing method
+ */
 BEGINdoAction
-	msg_t *pMsg;
-	struct json_object *pJson, *jval;
+  // the actual message object
+	msg_t* pMsg;
+	struct json_object* pJson;
+	struct json_object* *jval;
 	rsRetVal localRet;
 	uid_t uid;
-	gearInfo* gear;
+	gearInfo* gear = NULL;
 	gearInfo* gearToDelete = NULL;
-	char* appUuid;
-	char* gearUuid;
-	char* namespace;
+	char* appUuid = NULL;
+	char* gearUuid = NULL;
+	char* namespace = NULL;
 CODESTARTdoAction
 	pMsg = (msg_t*) ppString[0];
 
@@ -492,15 +637,14 @@ CODESTARTdoAction
       // update newest pointer
       pData->newestGearInfo = gear;
 
+      //LOCK
+      pthread_mutex_lock(&pData->lock);
+
       // see if we're at capacity and need to delete the oldest entry
       if(hashtable_count(pData->uidMap) >= pData->maxCacheSize) {
         DBGPRINTF("mmopenshift: cache is full - need to delete oldest entry\n");
         gearToDelete = pData->oldestGearInfo;
-        //dbgPrintInstInfo(pData);
       }
-
-      //LOCK
-      pthread_mutex_lock(&pData->lock);
 
       // delete the oldest entry if necessary
       if(gearToDelete != NULL) {
@@ -511,13 +655,15 @@ CODESTARTdoAction
         uid_t* uidToDelete = hashtable_remove(pData->uuidMap, gearToDelete->gearUuid);
         if(uidToDelete != NULL) {
           DBGPRINTF("mmopenshift: removing %d from uid map\n", *uidToDelete);
-          hashtable_remove(pData->uidMap, uidToDelete);
+          void* deleted = hashtable_remove(pData->uidMap, uidToDelete);
+          DBGPRINTF("mmopenshift: deletion successful: %s", (deleted != NULL) ? "true" : "false");
         }
       }
 
       DBGPRINTF("mmopenshift: adding to hash\n");
       hashtable_insert(pData->uidMap, keybuf, gear);
 
+      // allocate memory for the value (uid)
       CHKmalloc(keybuf = MALLOC(sizeof(uid_t)));
       *keybuf = uid;
       hashtable_insert(pData->uuidMap, strdup(gearUuid), keybuf);
