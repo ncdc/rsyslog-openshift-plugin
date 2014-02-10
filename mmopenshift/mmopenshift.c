@@ -558,7 +558,7 @@ BEGINdoAction
   // the actual message object
 	msg_t* pMsg;
 	struct json_object* pJson;
-	struct json_object* *jval;
+	struct json_object* jval;
 	rsRetVal localRet;
 	uid_t uid;
 	gearInfo* gear = NULL;
