@@ -337,7 +337,8 @@ static void watchThread(instanceData* pData) {
 
     // check for any available data
     // don't set a timeout as we'll be using the pipe to exit
-    rc = select(FD_SETSIZE, &readFds, NULL, NULL, NULL);
+    int maxFd = (pData->inotifyFd > pData->pipeFds[0]) ? pData->inotifyFd : pData->pipeFds[0];
+    rc = select(maxFd + 1, &readFds, NULL, NULL, NULL);
     if (rc == -1) {
       if(errno == EINTR) {
         // got interrupted; retry the select
@@ -354,7 +355,7 @@ static void watchThread(instanceData* pData) {
         done = 1;
       } else if(FD_ISSET(pData->inotifyFd, &readFds)) {
         // we have inotify data
-        while((rc = read(pData->inotifyFd, buffer, bufferSize) == -1)) {
+        while((rc = read(pData->inotifyFd, buffer, bufferSize)) == -1) {
           if(errno == EINTR) {
             continue;
           } else {
