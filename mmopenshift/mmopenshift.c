@@ -51,7 +51,9 @@ DEFobjCurrIf(errmsg);
 DEF_OMOD_STATIC_DATA
 
 /* module global variables */
-static es_str_t* es_uid = NULL;
+static msgPropDescr_t uidProperty;
+static char* getpwuidBuffer;
+static size_t getpwuidBufferSize;
 
 
 // struct to hold OpenShift metadata
@@ -73,15 +75,6 @@ typedef struct _gearInfo {
 
 // struct to hold plugin instance data
 typedef struct _instanceData {
-  // minimum uid value for OpenShift gears
-  uid_t gearUidStart;
-
-  // base directory where OpenShift gears are stored
-  char* gearBaseDir;
-
-  // maximum number of items to keep in the gear info cache
-  unsigned int maxCacheSize;
-
   // oldest gear info entry (by time of addition)
   gearInfo* oldestGearInfo;
 
@@ -110,6 +103,34 @@ typedef struct _instanceData {
   int inotifyWatchFd;
 } instanceData;
 
+/* module-global parameters */
+static struct cnfparamdescr modpdescr[] = {
+  { "gearuidstart", eCmdHdlrPositiveInt, 0 },
+  { "gearbasedir", eCmdHdlrGetWord, 0 },
+  { "maxcachesize", eCmdHdlrPositiveInt, 0 },
+};
+
+static struct cnfparamblk modpblk =
+  { CNFPARAMBLK_VERSION,
+    sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+    modpdescr
+  };
+
+struct modConfData_s {
+  rsconf_t *pConf;  /* our overall config object */
+
+  // minimum uid value for OpenShift gears
+  uid_t gearUidStart;
+
+  // base directory where OpenShift gears are stored
+  char* gearBaseDir;
+
+  // maximum number of items to keep in the gear info cache
+  unsigned int maxCacheSize;
+};
+
+static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current exec process */
+
 /**
  * Hash function for the uid->gearInfo map
  *
@@ -120,7 +141,7 @@ typedef struct _instanceData {
 static unsigned int
 uidHash(void *k)
 {
-	return((unsigned) *((uid_t*) k));
+  return((unsigned) *((uid_t*) k));
 }
 
 /**
@@ -131,7 +152,7 @@ uidHash(void *k)
 static int
 uidKeyEquals(void *key1, void *key2)
 {
-	return *((uid_t*) key1) == *((uid_t*) key2);
+  return *((uid_t*) key1) == *((uid_t*) key2);
 }
 
 /**
@@ -185,7 +206,7 @@ uuidHash(void* k)
 static int
 uuidKeyEquals(void *key1, void *key2)
 {
-	return !strcmp((char*)key1, (char*)key2);
+  return !strcmp((char*)key1, (char*)key2);
 }
 
 /**
@@ -197,21 +218,6 @@ static void
 uuidValueDestroy(void* value) {
   free(value);
 }
-
-
-/* tables for interfacing with the v6 config system */
-/* action (instance) parameters */
-static struct cnfparamdescr actpdescr[] = {
-	{ "gearuidstart", eCmdHdlrPositiveInt, 0 },
-	{ "gearbasedir", eCmdHdlrGetWord, 0 },
-	{ "maxcachesize", eCmdHdlrPositiveInt, 0 },
-};
-
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};
 
 
 BEGINcreateInstance
@@ -263,13 +269,24 @@ CODESTARTfreeInstance
     // close the write end of the pipe fd pair
     close(pData->pipeFds[1]);
   }
-
-  // need to free gearBaseDir as it either has the default value which we
-  // got via strdup(), or it came from the config system, and it's up to us
-  // to free in that case too
-  free(pData->gearBaseDir);
 ENDfreeInstance
 
+
+/**
+ * Set defaults for the module params
+ */
+static inline void
+setModuleParamDefaults() {
+  // OpenShift usually starts gears at uid 1000
+  runModConf->gearUidStart = 1000;
+
+  // keep up to 100 gears in the cache
+  runModConf->maxCacheSize = 100;
+
+  // use strdup here so we can free this var later
+  // regardless of if it was the default or user specified
+  runModConf->gearBaseDir = strdup("/var/lib/openshift");
+}
 
 /**
  * Set defaults for the plugin instance
@@ -277,19 +294,9 @@ ENDfreeInstance
 static inline void
 setInstParamDefaults(instanceData *pData)
 {
-	// OpenShift usually starts gears at uid 1000
-	pData->gearUidStart = 1000;
-
-	// keep up to 100 gears in the cache
-	pData->maxCacheSize = 100;
-
-	// no gears yet
-	pData->newestGearInfo = NULL;
-	pData->oldestGearInfo = NULL;
-
-	// use strdup here so we can free this var later
-	// regardless of if it was the default or user specified
-	pData->gearBaseDir = strdup("/var/lib/openshift");
+  // no gears yet
+  pData->newestGearInfo = NULL;
+  pData->oldestGearInfo = NULL;
 }
 
 /**
@@ -301,8 +308,9 @@ setInstParamDefaults(instanceData *pData)
  * as the key into the uuidMap, since the directory name should be the gear UUID.
  */
 static void watchThread(instanceData* pData) {
+  DBGPRINTF("mmopenshift: starting watchThread\n");
   // size the buffer to hold 1 struct + a filename of 50 chars + \0
-  size_t bufferSize = sizeof(struct inotify_event) + 51;
+  size_t bufferSize = sizeof(struct inotify_event) + NAME_MAX + 1;
 
   // the buffer we'll use to hold the inotify struct
   char buffer[bufferSize];
@@ -315,7 +323,6 @@ static void watchThread(instanceData* pData) {
 
   int rc = 0;
   int done = 0;
-  int count = 0;
 
   // loop until we're notified to stop via the pipe fd
   while(!done) {
@@ -332,109 +339,169 @@ static void watchThread(instanceData* pData) {
     // don't set a timeout as we'll be using the pipe to exit
     rc = select(FD_SETSIZE, &readFds, NULL, NULL, NULL);
     if (rc == -1) {
-      // TODO need to figure out what to do here:
-      //
-      // do we bail entirely and try to shut down the plugin instance?
-      //
-      // do we just log the error and ignore it, hoping it was a fluke?
+      if(errno == EINTR) {
+        // got interrupted; retry the select
+        continue;
+      } else {
+        errmsg.LogError(errno, RS_RET_ERR, "mmopenshift: select() error in watch thread.");
+        done = 1;
+        break;
+      }
     } else {
       if(FD_ISSET(pData->pipeFds[0], &readFds)) {
         // the pipe had data on it, which means we're ready to shut down
-        count = read(pData->pipeFds[0], buffer, 1);
+        rc = read(pData->pipeFds[0], buffer, 1);
         done = 1;
       } else if(FD_ISSET(pData->inotifyFd, &readFds)) {
         // we have inotify data
-        count = read(pData->inotifyFd, buffer, bufferSize);
-        if(count) {
-          // read succeeded, cast the buffer to the event variable
-          event = (struct inotify_event*)&buffer;
-          if(event->len) {
-            // we have a length for the filename
-            if(event->mask & IN_DELETE) {
-              // it was a delete event
-              if(event->mask & IN_ISDIR) {
-                // a directory was deleted, so we need to remove the data
-                // from the hashtables, if it's there
+        while((rc = read(pData->inotifyFd, buffer, bufferSize) == -1)) {
+          if(errno == EINTR) {
+            continue;
+          } else {
+            errmsg.LogError(errno, RS_RET_ERR, "mmopenshift: read() error in watch thread.");
+            done = 1;
+            break;
+          }
+        }
+        DBGPRINTF("mmopenshift: read finished with rc=%d\n", rc);
+        if(rc) {
+          DBGPRINTF("mmopenshift: read %d bytes from inotifyFd\n", rc);
+          int bufferIndex = 0;
+          do {
+            DBGPRINTF("mmopenshift: bufferIndex = %d\n", bufferIndex);
+            // read succeeded, cast the buffer to the event variable
+            event = (struct inotify_event*)&buffer[bufferIndex];
+            DBGPRINTF("mmopenshift: event->len = %d\n", event->len);
+            if(event->len) {
+              // we have a length for the filename
+              if(event->mask & IN_DELETE) {
+                DBGPRINTF("mmopenshift: delete event\n");
+                // it was a delete event
+                if(event->mask & IN_ISDIR) {
+                  DBGPRINTF("mmopenshift: delete directory\n");
+                  // a directory was deleted, so we need to remove the data
+                  // from the hashtables, if it's there
 
-                // acquire the lock
-                pthread_mutex_lock(&pData->lock);
+                  // acquire the lock
+                  pthread_mutex_lock(&pData->lock);
 
-                // event->name should be a gear uuid; see if it's in the
-                // uuid -> uid map
-                uid_t* uid = hashtable_remove(pData->uuidMap, event->name);
-                if(uid != NULL) {
-                  gearInfo* gi = hashtable_remove(pData->uidMap, uid);
-                  if(NULL == gi) {
-                    //TODO warn that we couldn't find the gearInfo in uidMap
+                  // event->name should be a gear uuid; see if it's in the
+                  // uuid -> uid map
+                  DBGPRINTF("mmopenshift: trying to remove %s from uuidMap\n", event->name);
+                  uid_t* uid = hashtable_remove(pData->uuidMap, event->name);
+                  if(uid != NULL) {
+                    DBGPRINTF("mmopenshift: removed uid = %d\n", *uid);
+                    DBGPRINTF("mmopenshift: trying to remove from uidMap\n");
+                    gearInfo* gi = hashtable_remove(pData->uidMap, uid);
+                    if(NULL == gi) {
+                      DBGPRINTF("mmopenshift: tried to remove uid %d from uidMap, but it wasn't there\n", *uid);
+                    } else {
+                      DBGPRINTF("mmopenshift: removal from uidMap succeeded\n");
+                    }
+                  } else {
+                    DBGPRINTF("mmopenshift: removed uid was NULL\n");
                   }
-                }
 
-                pthread_mutex_unlock(&pData->lock);
+                  pthread_mutex_unlock(&pData->lock);
+                }
               }
             }
-          }
-        } else {
-          // TODO need to figure what to do here:
-          //
-          // if the inotify fd is ready to read but we weren't able to do so,
-          // does it mean our buffer was too small, or did something else prevent
-          // the read from succeeding?
-          //
-          // if count is 0 that means "EOF"
-          //
-          // if count is -1 that means error
+            bufferIndex += sizeof(struct inotify_event) + event->len;
+            DBGPRINTF("mmopenshift: end of loop, bufferIndex now = %d\n", bufferIndex);
+          } while (bufferIndex < rc);
         }
       }
     }
   }
+  DBGPRINTF("mmopenshift: ending watchThread\n");
 }
 
+BEGINbeginCnfLoad
+CODESTARTbeginCnfLoad
+  runModConf = pModConf;
+  pModConf->pConf = pConf;
+ENDbeginCnfLoad
+
+BEGINendCnfLoad
+CODESTARTendCnfLoad
+ENDendCnfLoad
+
+BEGINsetModCnf
+  struct cnfparamvals *pvals;
+  int i;
+CODESTARTsetModCnf
+  setModuleParamDefaults();
+
+  pvals = nvlstGetParams(lst, &modpblk, NULL);
+  if(pvals == NULL) {
+    errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module "
+        "config parameters [module(...)]");
+    ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+  }
+
+  // check for config params specified in the config file
+  for(i = 0 ; i < modpblk.nParams ; ++i) {
+    if(!pvals[i].bUsed) {
+      continue;
+    }
+    if(!strcmp(modpblk.descr[i].name, "gearuidstart")) {
+      runModConf->gearUidStart = (uid_t)pvals[i].val.d.n;
+    } else if(!strcmp(modpblk.descr[i].name, "gearbasedir")) {
+      runModConf->gearBaseDir = es_str2cstr(pvals[i].val.d.estr, NULL);
+    } else if(!strcmp(modpblk.descr[i].name, "maxcachesize")) {
+      runModConf->maxCacheSize = (int)pvals[i].val.d.n;
+    } else {
+      dbgprintf("mmopenshift: program error, non-handled "
+        "param '%s'\n", modpblk.descr[i].name);
+    }
+  }
+
+finalize_it:
+  if(pvals != NULL) {
+    cnfparamvalsDestruct(pvals, &modpblk);
+  }
+ENDsetModCnf
+
+BEGINcheckCnf
+CODESTARTcheckCnf
+ENDcheckCnf
+
+BEGINactivateCnf
+CODESTARTactivateCnf
+  runModConf = pModConf;
+ENDactivateCnf
+
+BEGINfreeCnf
+CODESTARTfreeCnf
+  // need to free gearBaseDir as it either has the default value which we
+  // got via strdup(), or it came from the config system, and it's up to us
+  // to free in that case too
+  free(runModConf->gearBaseDir);
+ENDfreeCnf
 
 BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-	int rc;
+  int rc;
 CODESTARTnewActInst
-	DBGPRINTF("newActInst (mmopenshift)\n");
-	if((pvals = nvlstGetParams(lst, &actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
+  (void) lst; /* prevent compiler warning */
+  DBGPRINTF("newActInst (mmopenshift)\n");
 
   // follow conventions from other plugins
-	CODE_STD_STRING_REQUESTnewActInst(1)
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
-	CHKiRet(createInstance(&pData));
-	setInstParamDefaults(pData);
-
-	// check for config params specified in the config file
-	for(i = 0 ; i < actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed) {
-			continue;
-    }
-		if(!strcmp(actpblk.descr[i].name, "gearuidstart")) {
-		  pData->gearUidStart = (uid_t)pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "gearbasedir")) {
-			pData->gearBaseDir = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "maxcachesize")) {
-			pData->maxCacheSize = (int)pvals[i].val.d.n;
-		} else {
-			dbgprintf("mmopenshift: program error, non-handled "
-			  "param '%s'\n", actpblk.descr[i].name);
-		}
-	}
+  CODE_STD_STRING_REQUESTnewActInst(1)
+  CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
+  CHKiRet(createInstance(&pData));
 
   // create the uid->gearInfo map
-	pData->uidMap = create_hashtable(100, uidHash, uidKeyEquals, uidValueDestroy);
-	if(NULL == pData->uidMap) {
-		errmsg.LogError(0, RS_RET_ERR, "error: could not create uidMap, cannot activate action");
-		ABORT_FINALIZE(RS_RET_ERR);
+  pData->uidMap = create_hashtable(100, uidHash, uidKeyEquals, uidValueDestroy);
+  if(NULL == pData->uidMap) {
+    errmsg.LogError(0, RS_RET_ERR, "error: could not create uidMap, cannot activate action");
+    ABORT_FINALIZE(RS_RET_ERR);
   }
 
   // create the uuid->uid map
-	pData->uuidMap = create_hashtable(100, uuidHash, uuidKeyEquals, uuidValueDestroy);
-	if(NULL == pData->uidMap) {
-		errmsg.LogError(0, RS_RET_ERR, "error: could not create uuidMap, cannot activate action");
-		ABORT_FINALIZE(RS_RET_ERR);
+  pData->uuidMap = create_hashtable(100, uuidHash, uuidKeyEquals, uuidValueDestroy);
+  if(NULL == pData->uidMap) {
+    errmsg.LogError(0, RS_RET_ERR, "error: could not create uuidMap, cannot activate action");
+    ABORT_FINALIZE(RS_RET_ERR);
   }
 
   // create the pipe which we'll use to signal the inotify thread to stop
@@ -443,33 +510,34 @@ CODESTARTnewActInst
   // set up inotify
   pData->inotifyFd = inotify_init();
   if(-1 == pData->inotifyFd) {
-		errmsg.LogError(0, RS_RET_ERR, "error: could not initialize inotify");
-		ABORT_FINALIZE(RS_RET_ERR);
+    errmsg.LogError(0, RS_RET_ERR, "error: could not initialize inotify");
+    ABORT_FINALIZE(RS_RET_ERR);
   }
 
   // watch for deletions in the gear base dir
-  pData->inotifyWatchFd = inotify_add_watch(pData->inotifyFd, pData->gearBaseDir, IN_DELETE);
+  pData->inotifyWatchFd = inotify_add_watch(pData->inotifyFd, runModConf->gearBaseDir, IN_DELETE);
   if(-1 == pData->inotifyWatchFd) {
-		errmsg.LogError(0, RS_RET_ERR, "error: could not add inotify watch");
-		ABORT_FINALIZE(RS_RET_ERR);
+    errmsg.LogError(0, RS_RET_ERR, "error: could not add inotify watch");
+    ABORT_FINALIZE(RS_RET_ERR);
   }
 
   // set up our mutex
   rc = pthread_mutex_init(&pData->lock, NULL);
   if(rc != 0) {
-		errmsg.LogError(0, RS_RET_ERR, "error: could not create mutex, rc=%d", rc);
-		ABORT_FINALIZE(RS_RET_ERR);
+    errmsg.LogError(0, RS_RET_ERR, "error: could not create mutex, rc=%d", rc);
+    ABORT_FINALIZE(RS_RET_ERR);
   }
 
   // create the inotify watch thread
+  DBGPRINTF("mmopenshift: creating watchThread\n");
   rc = pthread_create(&pData->watchThread, NULL, (void*)&watchThread, pData);
   if(rc != 0) {
-		errmsg.LogError(0, RS_RET_ERR, "error: could not create thread, rc=%d", rc);
-		ABORT_FINALIZE(RS_RET_ERR);
+    errmsg.LogError(0, RS_RET_ERR, "error: could not create thread, rc=%d", rc);
+    ABORT_FINALIZE(RS_RET_ERR);
   }
 
 CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &actpblk);
+
 ENDnewActInst
 
 
@@ -477,9 +545,9 @@ BEGINdbgPrintInstInfo
   struct hashtable_itr* iter;
 CODESTARTdbgPrintInstInfo
   DBGPRINTF("mmopenshift\n");
-  DBGPRINTF("\tgearUidStart=%d\n", pData->gearUidStart);
-  DBGPRINTF("\tgearBaseDir=%s\n", pData->gearBaseDir);
-  DBGPRINTF("\tmaxCacheSize=%d\n", pData->maxCacheSize);
+  DBGPRINTF("\tgearUidStart=%d\n", runModConf->gearUidStart);
+  DBGPRINTF("\tgearBaseDir=%s\n", runModConf->gearBaseDir);
+  DBGPRINTF("\tmaxCacheSize=%d\n", runModConf->maxCacheSize);
   if(pData->oldestGearInfo != NULL) {
     DBGPRINTF("\toldest gear uuid=%s\n", pData->oldestGearInfo->gearUuid);
   }
@@ -556,21 +624,23 @@ finalize_it:
  */
 BEGINdoAction
   // the actual message object
-	msg_t* pMsg;
-	struct json_object* pJson;
-	struct json_object* jval;
-	rsRetVal localRet;
-	uid_t uid;
-	gearInfo* gear = NULL;
-	gearInfo* gearToDelete = NULL;
-	char* appUuid = NULL;
-	char* gearUuid = NULL;
-	char* namespace = NULL;
+  msg_t* pMsg;
+  struct json_object* pJson;
+  struct json_object* jval;
+  rsRetVal localRet;
+  uid_t uid;
+  gearInfo* gear = NULL;
+  gearInfo* gearToDelete = NULL;
+  char* appUuid = NULL;
+  char* gearUuid = NULL;
+  char* namespace = NULL;
+  struct passwd pwdata;
+  struct passwd* pwdataResult;
 CODESTARTdoAction
-	pMsg = (msg_t*) ppString[0];
+  pMsg = (msg_t*) ppString[0];
 
-	DBGPRINTF("mmopenshift: looking for !uid\n");
-  localRet = jsonFind(pMsg, es_uid, &pJson);
+  DBGPRINTF("mmopenshift: looking for !uid\n");
+  localRet = jsonFind(pMsg->json, &uidProperty, &pJson);
 
   if(pJson != NULL) {
     DBGPRINTF("mmopenshift: found !uid\n");
@@ -579,7 +649,7 @@ CODESTARTdoAction
     uid = json_object_get_int(pJson);
     DBGPRINTF("mmopenshift: uid=%d\n", uid);
 
-    if(uid < pData->gearUidStart) {
+    if(uid < runModConf->gearUidStart) {
       DBGPRINTF("mmopenshift: not an openshift uid\n");
       goto finalize_it;
     }
@@ -596,13 +666,25 @@ CODESTARTdoAction
       CHKmalloc(gear = MALLOC(sizeof(gearInfo)));
 
       DBGPRINTF("mmopenshift: getpwuid\n");
-      struct passwd* pwdata = getpwuid(uid);
+      int rc = getpwuid_r(uid, &pwdata, getpwuidBuffer, getpwuidBufferSize, &pwdataResult);
+      if (pwdataResult == NULL) {
+        if (rc == 0) {
+          DBGPRINTF("mmopenshift: unable to find uid %d\n", uid);
+          // don't do any additional processing
+          FINALIZE
+        } else {
+          errmsg.LogError(rc, RS_RET_ERR, "mmopenshift: error looking up user information for uid %d", uid);
+          // don't do any additional processing
+          FINALIZE
+        }
+      }
 
-      gearUuid = pwdata->pw_name;
+      gearUuid = pwdata.pw_name;
 
       //NOTE: readOpenShiftEnvVar returns memory that was malloc'd
-      appUuid = readOpenShiftEnvVar(pData->gearBaseDir, gearUuid, "OPENSHIFT_APP_UUID");
-      namespace = readOpenShiftEnvVar(pData->gearBaseDir, gearUuid, "OPENSHIFT_NAMESPACE");
+      //NOTE: return value will be NULL if not found
+      appUuid = readOpenShiftEnvVar(runModConf->gearBaseDir, gearUuid, "OPENSHIFT_APP_UUID");
+      namespace = readOpenShiftEnvVar(runModConf->gearBaseDir, gearUuid, "OPENSHIFT_NAMESPACE");
 
       // fill in the gearInfo data
       // gearUuid
@@ -641,7 +723,7 @@ CODESTARTdoAction
       pthread_mutex_lock(&pData->lock);
 
       // see if we're at capacity and need to delete the oldest entry
-      if(hashtable_count(pData->uidMap) >= pData->maxCacheSize) {
+      if(hashtable_count(pData->uidMap) >= runModConf->maxCacheSize) {
         DBGPRINTF("mmopenshift: cache is full - need to delete oldest entry\n");
         gearToDelete = pData->oldestGearInfo;
       }
@@ -680,14 +762,20 @@ CODESTARTdoAction
 
     pJson = json_object_new_object();
 
-    jval = json_object_new_string(appUuid);
-    json_object_object_add(pJson, "AppUuid", jval);
+    if(appUuid != NULL) {
+      jval = json_object_new_string(appUuid);
+      json_object_object_add(pJson, "AppUuid", jval);
+    }
 
-    jval = json_object_new_string(gearUuid);
-    json_object_object_add(pJson, "GearUuid", jval);
+    if(gearUuid != NULL) {
+      jval = json_object_new_string(gearUuid);
+      json_object_object_add(pJson, "GearUuid", jval);
+    }
 
-    jval = json_object_new_string(namespace);
-    json_object_object_add(pJson, "Namespace", jval);
+    if(namespace != NULL) {
+      jval = json_object_new_string(namespace);
+      json_object_object_add(pJson, "Namespace", jval);
+    }
 
     json_object_object_add(pMsg->json, "OpenShift", pJson);
   }
@@ -698,19 +786,19 @@ ENDdoAction
 BEGINparseSelectorAct
 CODESTARTparseSelectorAct
 CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	if(strncmp((char*) p, ":mmopenshift:", sizeof(":mmopenshift:") - 1)) {
-		errmsg.LogError(0, RS_RET_LEGA_ACT_NOT_SUPPORTED,
-			"mmopenshift supports only v6+ config format, use: "
-			"action(type=\"mmopenshift\" ...)");
-	}
-	ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+  if(strncmp((char*) p, ":mmopenshift:", sizeof(":mmopenshift:") - 1)) {
+    errmsg.LogError(0, RS_RET_LEGA_ACT_NOT_SUPPORTED,
+      "mmopenshift supports only v6+ config format, use: "
+      "action(type=\"mmopenshift\" ...)");
+  }
+  ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
 CODE_STD_FINALIZERparseSelectorAct
 ENDparseSelectorAct
 
 
 BEGINmodExit
 CODESTARTmodExit
-	objRelease(errmsg, CORE_COMPONENT);
+  objRelease(errmsg, CORE_COMPONENT);
 ENDmodExit
 
 
@@ -718,17 +806,26 @@ BEGINqueryEtryPt
 CODESTARTqueryEtryPt
 CODEqueryEtryPt_STD_OMOD_QUERIES
 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+CODEqueryEtryPt_STD_CONF2_QUERIES
+CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES 
 ENDqueryEtryPt
 
 
 
 BEGINmodInit()
 CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
+  *ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
 CODEmodInit_QueryRegCFSLineHdlr
-	DBGPRINTF("mmopenshift: module compiled with rsyslog version %s.\n", VERSION);
-	CHKiRet(objUse(errmsg, CORE_COMPONENT));
+  DBGPRINTF("mmopenshift: module compiled with rsyslog version %s.\n", VERSION);
+  CHKiRet(objUse(errmsg, CORE_COMPONENT));
 
   // initialize estring for !uid json path
-  es_uid = es_newStrFromCStr("!uid", 4);
+  CHKiRet(msgPropDescrFill(&uidProperty, (uchar*)"!uid", 4));
+
+  getpwuidBufferSize = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (getpwuidBufferSize == (size_t)-1) {
+    getpwuidBufferSize = 16384; // should be plenty big
+  }
+
+  CHKmalloc(getpwuidBuffer = MALLOC(getpwuidBufferSize));
 ENDmodInit
