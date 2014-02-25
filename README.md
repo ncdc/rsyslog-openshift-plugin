@@ -25,8 +25,10 @@ The plugin will create the $!OpenShift subtree in the message's JSON and add the
 
 **gearBaseDir** - the base directory where OpenShift gears reside (default: /var/lib/openshift)
 
+**maxCacheSize** - the maximum number of elements to store in the in-memory cache
+
 # Installing the plugin
-Requires the new (v6+) configuration file format. Tested with the v7-stable branch of rsyslog from GitHub.
+Requires the new (v6+) configuration file format. Tested with the v7-stable branch of rsyslog (as of commit df77823) from GitHub.
 
 1. Apply the patch 'rsyslog-openshift.patch' to the source of rsyslog:
 
@@ -37,9 +39,8 @@ Requires the new (v6+) configuration file format. Tested with the v7-stable bran
 1. Update autotools files:
 
         cd path/to/rsyslog
-        autoreconf
+        autogen.sh --enable-mmopenshift ...
 
-1. Specify `--enable-mmopenshift` when running `configure`
 1. make && make install
 
 # Sample Configuration
@@ -64,6 +65,7 @@ Requires the new (v6+) configuration file format. Tested with the v7-stable bran
         }
 
         module(load="mmopenshift")
+        action(type="mmopenshift")
         if $!OpenShift!AppUuid != '' then
           *.* action(type="omfile" file="/var/log/openshift_gears" template="OpenShift")
         else {
