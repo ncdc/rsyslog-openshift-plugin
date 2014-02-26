@@ -51,7 +51,7 @@ DEFobjCurrIf(errmsg);
 DEF_OMOD_STATIC_DATA
 
 /* module global variables */
-static msgPropDescr_t uidProperty;
+static es_str_t* uidProperty;
 static char* getpwuidBuffer;
 static size_t getpwuidBufferSize;
 
@@ -641,7 +641,7 @@ CODESTARTdoAction
   pMsg = (msg_t*) ppString[0];
 
   DBGPRINTF("mmopenshift: looking for !uid\n");
-  localRet = jsonFind(pMsg->json, &uidProperty, &pJson);
+  localRet = jsonFind(pMsg, uidProperty, &pJson);
 
   if(pJson != NULL) {
     DBGPRINTF("mmopenshift: found !uid\n");
@@ -821,7 +821,7 @@ CODEmodInit_QueryRegCFSLineHdlr
   CHKiRet(objUse(errmsg, CORE_COMPONENT));
 
   // initialize estring for !uid json path
-  CHKiRet(msgPropDescrFill(&uidProperty, (uchar*)"!uid", 4));
+  uidProperty = es_newStrFromCStr("!uid", 4);
 
   getpwuidBufferSize = sysconf(_SC_GETPW_R_SIZE_MAX);
   if (getpwuidBufferSize == (size_t)-1) {
