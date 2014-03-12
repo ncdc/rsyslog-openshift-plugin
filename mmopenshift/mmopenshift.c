@@ -52,8 +52,6 @@ DEF_OMOD_STATIC_DATA
 
 /* module global variables */
 static es_str_t* uidProperty;
-static char* getpwuidBuffer;
-static size_t getpwuidBufferSize;
 
 
 // struct to hold OpenShift metadata
@@ -67,19 +65,16 @@ typedef struct _gearInfo {
   // OpenShift application domain
   char* namespace;
 
-  // pointer to next oldest gearInfo
+  // pointers to prev/next oldest gearInfo
   // used during FIFO eviction if the cache gets full
+  struct _gearInfo* prev;
   struct _gearInfo* next;
 } gearInfo;
 
-
 // struct to hold plugin instance data
 typedef struct _instanceData {
-  // oldest gear info entry (by time of addition)
-  gearInfo* oldestGearInfo;
-
-  // newest gear info entry (by time of addition)
-  gearInfo* newestGearInfo;
+  // sentinel node
+  gearInfo* sentinel;
 
   // map from uid to gearInfo
   struct hashtable *uidMap;
@@ -101,6 +96,12 @@ typedef struct _instanceData {
 
   // inotify watch descriptor
   int inotifyWatchFd;
+
+  // buffer for getpwuid
+  char* getpwuidBuffer;
+
+  // buffer size
+  size_t getpwuidBufferSize;
 } instanceData;
 
 /* module-global parameters */
@@ -220,6 +221,38 @@ uuidValueDestroy(void* value) {
 }
 
 
+BEGINdbgPrintInstInfo
+  struct hashtable_itr* iter;
+  gearInfo* gi;
+CODESTARTdbgPrintInstInfo
+  DBGPRINTF("mmopenshift\n");
+  DBGPRINTF("\tgearUidStart=%d\n", runModConf->gearUidStart);
+  DBGPRINTF("\tgearBaseDir=%s\n", runModConf->gearBaseDir);
+  DBGPRINTF("\tmaxCacheSize=%d\n", runModConf->maxCacheSize);
+  DBGPRINTF("\tgearInfo linked list:\n");
+  gi = pData->sentinel->next;
+  while(gi != pData->sentinel) {
+    DBGPRINTF("\t\tapp=%s gear=%s ns=%s\n", gi->appUuid, gi->gearUuid, gi->namespace);
+    gi = gi->next;
+  }
+  if(pData->uidMap != NULL && hashtable_count(pData->uidMap) > 0) {
+    DBGPRINTF("\tuidMap:\n");
+    iter = hashtable_iterator(pData->uidMap);
+    do {
+      gi = (gearInfo*)hashtable_iterator_value(iter);
+      DBGPRINTF("\t\tuid=%d app=%s gear=%s ns=%s\n", *(uid_t*)hashtable_iterator_key(iter), gi->appUuid, gi->gearUuid, gi->namespace);
+    } while(hashtable_iterator_advance(iter));
+  }
+  if(pData->uuidMap != NULL && hashtable_count(pData->uuidMap) > 0) {
+    DBGPRINTF("\tuuidMap:\n");
+    iter = hashtable_iterator(pData->uuidMap);
+    do {
+      DBGPRINTF("\t\tuuid=%s uid=%d\n", (char*)hashtable_iterator_key(iter), *(uid_t*)hashtable_iterator_value(iter));
+    } while(hashtable_iterator_advance(iter));
+  }
+ENDdbgPrintInstInfo
+
+
 BEGINcreateInstance
 CODESTARTcreateInstance
 ENDcreateInstance
@@ -269,6 +302,8 @@ CODESTARTfreeInstance
     // close the write end of the pipe fd pair
     close(pData->pipeFds[1]);
   }
+
+  free(pData->getpwuidBuffer);
 ENDfreeInstance
 
 
@@ -294,9 +329,6 @@ setModuleParamDefaults() {
 static inline void
 setInstParamDefaults(instanceData *pData)
 {
-  // no gears yet
-  pData->newestGearInfo = NULL;
-  pData->oldestGearInfo = NULL;
 }
 
 /**
@@ -397,11 +429,22 @@ static void watchThread(instanceData* pData) {
                     if(NULL == gi) {
                       DBGPRINTF("mmopenshift: tried to remove uid %d from uidMap, but it wasn't there\n", *uid);
                     } else {
+                      // update linked list pointers
+                      gi->prev->next = gi->next;
+                      gi->next->prev = gi->prev;
+
+                      DBGPRINTF("mmopenshift: freeing gearInfo\n");
+                      free(gi);
                       DBGPRINTF("mmopenshift: removal from uidMap succeeded\n");
                     }
+
+                    DBGPRINTF("mmopenshift: freeing uid\n");
+                    free(uid);
                   } else {
                     DBGPRINTF("mmopenshift: removed uid was NULL\n");
                   }
+
+                  dbgPrintInstInfo(pData);
 
                   pthread_mutex_unlock(&pData->lock);
                 }
@@ -492,18 +535,22 @@ CODESTARTnewActInst
   CHKiRet(createInstance(&pData));
 
   // create the uid->gearInfo map
-  pData->uidMap = create_hashtable(100, uidHash, uidKeyEquals, uidValueDestroy);
+  pData->uidMap = create_hashtable(runModConf->maxCacheSize, uidHash, uidKeyEquals, uidValueDestroy);
   if(NULL == pData->uidMap) {
     errmsg.LogError(0, RS_RET_ERR, "error: could not create uidMap, cannot activate action");
     ABORT_FINALIZE(RS_RET_ERR);
   }
 
   // create the uuid->uid map
-  pData->uuidMap = create_hashtable(100, uuidHash, uuidKeyEquals, uuidValueDestroy);
+  pData->uuidMap = create_hashtable(runModConf->maxCacheSize, uuidHash, uuidKeyEquals, uuidValueDestroy);
   if(NULL == pData->uidMap) {
     errmsg.LogError(0, RS_RET_ERR, "error: could not create uuidMap, cannot activate action");
     ABORT_FINALIZE(RS_RET_ERR);
   }
+
+  CHKmalloc(pData->sentinel = MALLOC(sizeof(gearInfo)));
+  pData->sentinel->prev = pData->sentinel;
+  pData->sentinel->next = pData->sentinel;
 
   // create the pipe which we'll use to signal the inotify thread to stop
   pipe(pData->pipeFds);
@@ -537,39 +584,15 @@ CODESTARTnewActInst
     ABORT_FINALIZE(RS_RET_ERR);
   }
 
+  pData->getpwuidBufferSize = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (pData->getpwuidBufferSize == (size_t)-1) {
+    pData->getpwuidBufferSize = 16384; // should be plenty big
+  }
+
+  CHKmalloc(pData->getpwuidBuffer = MALLOC(pData->getpwuidBufferSize));
+
 CODE_STD_FINALIZERnewActInst
-
 ENDnewActInst
-
-
-BEGINdbgPrintInstInfo
-  struct hashtable_itr* iter;
-CODESTARTdbgPrintInstInfo
-  DBGPRINTF("mmopenshift\n");
-  DBGPRINTF("\tgearUidStart=%d\n", runModConf->gearUidStart);
-  DBGPRINTF("\tgearBaseDir=%s\n", runModConf->gearBaseDir);
-  DBGPRINTF("\tmaxCacheSize=%d\n", runModConf->maxCacheSize);
-  if(pData->oldestGearInfo != NULL) {
-    DBGPRINTF("\toldest gear uuid=%s\n", pData->oldestGearInfo->gearUuid);
-  }
-  if(pData->newestGearInfo != NULL) {
-    DBGPRINTF("\tnewest gear uuid=%s\n", pData->newestGearInfo->gearUuid);
-  }
-  if(pData->uidMap != NULL && hashtable_count(pData->uidMap) > 0) {
-    DBGPRINTF("\tuidMap keys\n");
-    iter = hashtable_iterator(pData->uidMap);
-    do {
-      DBGPRINTF("\t\t%d\n", *(uid_t*)hashtable_iterator_key(iter));
-    } while(hashtable_iterator_advance(iter));
-  }
-  if(pData->uuidMap != NULL && hashtable_count(pData->uuidMap) > 0) {
-    DBGPRINTF("\tuuidMap keys\n");
-    iter = hashtable_iterator(pData->uuidMap);
-    do {
-      DBGPRINTF("\t\t%s\n", (char*)hashtable_iterator_key(iter));
-    } while(hashtable_iterator_advance(iter));
-  }
-ENDdbgPrintInstInfo
 
 
 BEGINtryResume
@@ -604,6 +627,9 @@ static char* readOpenShiftEnvVar(char* gearBaseDir, char* gearUuid, char* varNam
 
   // no longer needed, so free it
   free(filename);
+
+  // add space for \0
+  size++;
 
   CHKmalloc(data = MALLOC(size));
 
@@ -655,10 +681,11 @@ CODESTARTdoAction
       goto finalize_it;
     }
 
-    DBGPRINTF("mmopenshift: searching uidMap for uid %d\n", uid);
+    DBGPRINTF("mmopenshift: acquiring lock\n");
     pthread_mutex_lock(&pData->lock);
+
+    DBGPRINTF("mmopenshift: searching uidMap for uid %d\n", uid);
     gear = hashtable_search(pData->uidMap, &uid);
-    pthread_mutex_unlock(&pData->lock);
 
     if(NULL == gear) {
       DBGPRINTF("mmopenshift: key not found\n");
@@ -667,14 +694,16 @@ CODESTARTdoAction
       CHKmalloc(gear = MALLOC(sizeof(gearInfo)));
 
       DBGPRINTF("mmopenshift: getpwuid\n");
-      int rc = getpwuid_r(uid, &pwdata, getpwuidBuffer, getpwuidBufferSize, &pwdataResult);
+      int rc = getpwuid_r(uid, &pwdata, pData->getpwuidBuffer, pData->getpwuidBufferSize, &pwdataResult);
       if (pwdataResult == NULL) {
         if (rc == 0) {
           DBGPRINTF("mmopenshift: unable to find uid %d\n", uid);
+          pthread_mutex_unlock(&pData->lock);
           // don't do any additional processing
           FINALIZE
         } else {
           errmsg.LogError(rc, RS_RET_ERR, "mmopenshift: error looking up user information for uid %d", uid);
+          pthread_mutex_unlock(&pData->lock);
           // don't do any additional processing
           FINALIZE
         }
@@ -707,40 +736,48 @@ CODESTARTdoAction
       CHKmalloc(keybuf = MALLOC(sizeof(uid_t)));
       *keybuf = uid;
 
-      // first entry, set oldest pointer
-      if(NULL == pData->oldestGearInfo) {
-        pData->oldestGearInfo = gear;
-      }
+      // new gear's "next" is the sentinel aka end of list
+      gear->next = pData->sentinel;
 
-      // set newest->next pointer
-      if(pData->newestGearInfo != NULL) {
-        pData->newestGearInfo->next = gear;
-      }
+      // new gear's "prev" is the current last node
+      gear->prev = pData->sentinel->prev;
 
-      // update newest pointer
-      pData->newestGearInfo = gear;
+      // set sentinel->prev to new gear
+      gear->next->prev = gear;
 
-      //LOCK
-      pthread_mutex_lock(&pData->lock);
+      // update last node's next to point at this new node
+      gear->prev->next = gear;
+
+      DBGPRINTF("Added new gearInfo\n");
+      dbgPrintInstInfo(pData);
 
       // see if we're at capacity and need to delete the oldest entry
       if(hashtable_count(pData->uidMap) >= runModConf->maxCacheSize) {
         DBGPRINTF("mmopenshift: cache is full - need to delete oldest entry\n");
-        gearToDelete = pData->oldestGearInfo;
+        gearToDelete = pData->sentinel->next;
       }
 
       // delete the oldest entry if necessary
       if(gearToDelete != NULL) {
-        // update oldest entry pointer
-        pData->oldestGearInfo = pData->oldestGearInfo->next;
+        gearToDelete->prev->next = gearToDelete->next;
+        gearToDelete->next->prev = gearToDelete->prev;
 
         DBGPRINTF("mmopenshift: removing %s from uuid map\n", gearToDelete->gearUuid);
         uid_t* uidToDelete = hashtable_remove(pData->uuidMap, gearToDelete->gearUuid);
         if(uidToDelete != NULL) {
           DBGPRINTF("mmopenshift: removing %d from uid map\n", *uidToDelete);
           void* deleted = hashtable_remove(pData->uidMap, uidToDelete);
-          DBGPRINTF("mmopenshift: deletion successful: %s", (deleted != NULL) ? "true" : "false");
+          if (deleted != NULL) {
+            DBGPRINTF("mmopenshift: found key in map\n");
+          } else {
+            DBGPRINTF("mmopenshift: unable to find %d in uid map\n", *uidToDelete);
+          }
+
+          free(uidToDelete);
+          free(gearToDelete);
         }
+
+        dbgPrintInstInfo(pData);
       }
 
       DBGPRINTF("mmopenshift: adding to hash\n");
@@ -751,8 +788,7 @@ CODESTARTdoAction
       *keybuf = uid;
       hashtable_insert(pData->uuidMap, strdup(gearUuid), keybuf);
 
-      //UNLOCK
-      pthread_mutex_unlock(&pData->lock);
+      dbgPrintInstInfo(pData);
     } else {
       DBGPRINTF("mmopenshift: found key in hash\n");
 
@@ -779,6 +815,9 @@ CODESTARTdoAction
     }
 
     json_object_object_add(pMsg->json, "OpenShift", pJson);
+
+    //UNLOCK
+    pthread_mutex_unlock(&pData->lock);
   }
 finalize_it:
 ENDdoAction
@@ -812,7 +851,6 @@ CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
 ENDqueryEtryPt
 
 
-
 BEGINmodInit()
 CODESTARTmodInit
   *ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
@@ -822,11 +860,4 @@ CODEmodInit_QueryRegCFSLineHdlr
 
   // initialize estring for !uid json path
   uidProperty = es_newStrFromCStr("!uid", 4);
-
-  getpwuidBufferSize = sysconf(_SC_GETPW_R_SIZE_MAX);
-  if (getpwuidBufferSize == (size_t)-1) {
-    getpwuidBufferSize = 16384; // should be plenty big
-  }
-
-  CHKmalloc(getpwuidBuffer = MALLOC(getpwuidBufferSize));
 ENDmodInit
