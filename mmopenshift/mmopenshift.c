@@ -50,6 +50,8 @@ MODULE_CNFNAME("mmopenshift")
 DEFobjCurrIf(errmsg);
 DEF_OMOD_STATIC_DATA
 
+extern int Debug;
+
 /* module global variables */
 static es_str_t* uidProperty = NULL;
 
@@ -216,10 +218,21 @@ stringKeyEquals(void *key1, void *key2)
 }
 
 
+static void dbgPrintGearInfo(gearInfo* gi) {
+}
+
+
 BEGINdbgPrintInstInfo
   struct hashtable_itr* iter;
   gearInfo* gi;
+  unsigned int i;
 CODESTARTdbgPrintInstInfo
+
+  // short circuit if debugging is disabled for optimal performance
+  if(!Debug) {
+    RETiRet;
+  }
+
   DBGPRINTF("mmopenshift\n");
   DBGPRINTF("\tgearUidStart=%d\n", runModConf->gearUidStart);
   DBGPRINTF("\tgearBaseDir=%s\n", runModConf->gearBaseDir);
@@ -227,7 +240,13 @@ CODESTARTdbgPrintInstInfo
   DBGPRINTF("\tgearInfo linked list:\n");
   gi = pData->sentinel->next;
   while(gi != pData->sentinel) {
-    //DBGPRINTF("\t\tapp=%s gear=%s ns=%s\n", gi->appUuid, gi->gearUuid, gi->namespace);
+    for(i = 0; i < runModConf->metadataCount; i++) {
+      char* value = hashtable_search(gi->metadata, runModConf->metadataNames[i]);
+      if(value) {
+        DBGPRINTF("%s=%s ", runModConf->metadataNames[i], value);
+      }
+    }
+    DBGPRINTF("\n");
     gi = gi->next;
   }
   if(pData->uidMap != NULL && hashtable_count(pData->uidMap) > 0) {
@@ -235,7 +254,14 @@ CODESTARTdbgPrintInstInfo
     iter = hashtable_iterator(pData->uidMap);
     do {
       gi = (gearInfo*)hashtable_iterator_value(iter);
-      //DBGPRINTF("\t\tuid=%d app=%s gear=%s ns=%s\n", *(uid_t*)hashtable_iterator_key(iter), gi->appUuid, gi->gearUuid, gi->namespace);
+      DBGPRINTF("\t\tuid=%d", *(uid_t*)hashtable_iterator_key(iter));
+      for(i = 0; i < runModConf->metadataCount; i++) {
+        char* value = hashtable_search(gi->metadata, runModConf->metadataNames[i]);
+        if(value) {
+          DBGPRINTF(" %s=%s", runModConf->metadataNames[i], value);
+        }
+      }
+      DBGPRINTF("\n");
     } while(hashtable_iterator_advance(iter));
     free(iter);
     iter = NULL;
@@ -778,6 +804,8 @@ CODESTARTdoAction
       }
 
       gearUuid = pwdata.pw_name;
+      DBGPRINTF("mmopenshift: gearUuid = %s\n", gearUuid);
+
       gear->gearUuid = strdup(gearUuid);
 
       for(i = 0; i < runModConf->metadataCount; i++) {
@@ -785,8 +813,10 @@ CODESTARTdoAction
         //NOTE: return value will be NULL if not found
         metadataValue = readOpenShiftEnvVar(runModConf->gearBaseDir, gearUuid, runModConf->metadataNames[i]);
 
-        // fill in the gearInfo data
-        hashtable_insert(gear->metadata, strdup(runModConf->metadataNames[i]), metadataValue);
+        if(metadataValue) {
+          // fill in the gearInfo data
+          hashtable_insert(gear->metadata, strdup(runModConf->metadataNames[i]), metadataValue);
+        }
       }
 
       // allocate memory for the key (uid)
@@ -838,7 +868,7 @@ CODESTARTdoAction
         dbgPrintInstInfo(pData);
       }
 
-      DBGPRINTF("mmopenshift: adding to hash\n");
+      DBGPRINTF("mmopenshift: adding uid %d / uuid %s to hash\n", uid, gearUuid);
       hashtable_insert(pData->uidMap, keybuf, gear);
 
       // allocate memory for the value (uid)
