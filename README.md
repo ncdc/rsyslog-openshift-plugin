@@ -8,27 +8,31 @@ This plugin only works if the message has the $!uid JSON property, which can be 
 - SysSock.Annotate
 
 # Operation
-This plugin examines each message's $!uid JSON property. If the property exists and is greater than or equal to gearUidStart, the plugin will attempt to retrieve the following metadata for the gear:
+This plugin examines each message's $!uid JSON property. If the property exists and is greater than or equal to gearUidStart, the plugin will attempt to retrieve the following metadata for the gear (this is the default list and can be configured):
 
 - OPENSHIFT_GEAR_UUID
 - OPENSHIFT_APP_UUID
 - OPENSHIFT_NAMESPACE
+- OPENSHIFT_APP_NAME
 
-The plugin will create the $!OpenShift subtree in the message's JSON and add the following keys:
+The plugin will create the $!OpenShift subtree in the message's JSON and add keys corresponding to each of the gear's metadata items listed above. For example, with the default configuration:
 
-- $!OpenShift!GearUuid
-- $!OpenShift!AppUuid
-- $!OpenShift!Namespace
+- $!OpenShift!OPENSHIFT_GEAR_UUID
+- $!OpenShift!OPENSHIFT_APP_UUID
+- $!OpenShift!OPENSHIFT_NAMESPACE
+- $!OpenShift!OPENSHIFT_APP_NAME
 
 # Configuration
 **gearUidStart** - the first user ID to be used for OpenShift gears (default: 1000)
 
-**gearBaseDir** - the base directory where OpenShift gears reside (default: /var/lib/openshift)
+**gearBaseDir** - the base directory where OpenShift gears reside (default: "/var/lib/openshift")
 
-**maxCacheSize** - the maximum number of elements to store in the in-memory cache
+**maxCacheSize** - the maximum number of elements to store in the in-memory cache (default: 100)
+
+**metadata** - an array listing which of a gear's metadata items to retrieve (default: ["OPENSHIFT_GEAR_UUID", "OPENSHIFT_APP_UUID", "OPENSHIFT_NAMESPACE", "OPENSHIFT_APP_NAME"])
 
 # Installing the plugin
-Requires the new (v6+) configuration file format. Tested with the v7-stable branch of rsyslog (as of commit df77823) from GitHub.
+Requires the new (v6+) configuration file format. Tested with rsyslog 7.4.7.
 
 1. Apply the patch 'rsyslog-openshift.patch' to the source of rsyslog:
 
@@ -54,11 +58,13 @@ Requires the new (v6+) configuration file format. Tested with the v7-stable bran
                 constant(value=" ")
                 property(name="syslogtag")
                 constant(value=" app=")
-                property(name="$!OpenShift!AppUuid")
-                constant(value=" gear=")
-                property(name="$!OpenShift!GearUuid")
+                property(name="$!OpenShift!OPENSHIFT_APP_NAME")
                 constant(value=" ns=")
-                property(name="$!OpenShift!Namespace")
+                property(name="$!OpenShift!OPENSHIFT_NAMESPACE")
+                constant(value=" appUuid=")
+                property(name="$!OpenShift!OPENSHIFT_APP_UUID")
+                constant(value=" gearUuid=")
+                property(name="$!OpenShift!OPENSHIFT_GEAR_UUID")
                 property(name="msg" spifno1stsp="on")
                 property(name="msg" droplastlf="on")
                 constant(value="\n")
@@ -66,7 +72,7 @@ Requires the new (v6+) configuration file format. Tested with the v7-stable bran
 
         module(load="mmopenshift")
         action(type="mmopenshift")
-        if $!OpenShift!AppUuid != '' then
+        if $!OpenShift!OPENSHIFT_APP_UUID != '' then
           *.* action(type="omfile" file="/var/log/openshift_gears" template="OpenShift")
         else {
           *.info;mail.none;authpriv.none;cron.none      action(type="omfile" file="/var/log/messages")
