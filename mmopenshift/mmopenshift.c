@@ -65,6 +65,29 @@ typedef struct _gearInfo {
   struct _gearInfo* next;
 } gearInfo;
 
+static void freeGearInfo(gearInfo* gi) {
+  if(gi) {
+    if(gi->gearUuid) {
+      free(gi->gearUuid);
+      gi->gearUuid = NULL;
+    }
+
+    if(gi->metadata) {
+      hashtable_destroy(gi->metadata, 1);
+      gi->metadata = NULL;
+    }
+
+    gi->prev->next = gi->next;
+    gi->next->prev = gi->prev;
+
+    free(gi);
+  }
+}
+
+static void hashtable_freeGearInfo(void* value) {
+  freeGearInfo((gearInfo*)value);
+}
+
 // struct to hold plugin instance data
 typedef struct _instanceData {
   // sentinel node
@@ -158,30 +181,6 @@ uidKeyEquals(void *key1, void *key2)
 }
 
 /**
- * Value "destructor" function for the uid->gearInfo map
- *
- * Invoked when a key is removed from the uidMap.
- *
- * Value type is gearInfo.
- *
- * Frees the memory we previously allocated in the gearInfo struct as well as
- * the struct itself.
- */
-static void
-uidValueDestroy(void* value) {
-  gearInfo* gi = (gearInfo*)value;
-  if(gi) {
-    if(gi->metadata) {
-      hashtable_destroy(gi->metadata, 1);
-      gi->metadata = NULL;
-    }
-    gi->prev->next = gi->next;
-    gi->next->prev = gi->prev;
-    free(gi);
-  }
-}
-
-/**
  * Hash function for the uuid->uid map
  *
  * Key type is char* (gear UUID)
@@ -269,6 +268,11 @@ CODESTARTfreeInstance
   int rc = -1;
   rc = write(pData->pipeFds[1], "x", 1);
 
+  // wait for watchThread to shut down
+  DBGPRINTF("mmopenshift: joining watchThread\n");
+  pthread_join(pData->watchThread, NULL);
+  DBGPRINTF("mmopenshift: watchThread stopped\n");
+
   // lock the mutex for the 2 maps
   pthread_mutex_lock(&pData->lock);
 
@@ -288,9 +292,7 @@ CODESTARTfreeInstance
   if(pData->sentinel != NULL) {
     while(pData->sentinel->next != pData->sentinel) {
       gearInfo* toDelete = pData->sentinel->next;
-      toDelete->prev->next = toDelete->next;
-      toDelete->next->prev = toDelete->prev;
-      free(toDelete);
+      freeGearInfo(toDelete);
       toDelete = NULL;
     }
     free(pData->sentinel);
@@ -449,12 +451,8 @@ static void watchThread(instanceData* pData) {
                     if(NULL == gi) {
                       DBGPRINTF("mmopenshift: tried to remove uid %d from uidMap, but it wasn't there\n", *uid);
                     } else {
-                      // update linked list pointers
-                      gi->prev->next = gi->next;
-                      gi->next->prev = gi->prev;
-
                       DBGPRINTF("mmopenshift: freeing gearInfo\n");
-                      free(gi);
+                      freeGearInfo(gi);
                       gi = NULL;
                       DBGPRINTF("mmopenshift: removal from uidMap succeeded\n");
                     }
@@ -513,6 +511,11 @@ CODESTARTsetModCnf
     if(!strcmp(modpblk.descr[i].name, "gearuidstart")) {
       runModConf->gearUidStart = (uid_t)pvals[i].val.d.n;
     } else if(!strcmp(modpblk.descr[i].name, "gearbasedir")) {
+      if(runModConf->gearBaseDir != NULL) {
+        // need to free to strdup'd value from setModuleParamDefaults
+        // before using the value from the config file
+        free(runModConf->gearBaseDir);
+      }
       runModConf->gearBaseDir = es_str2cstr(pvals[i].val.d.estr, NULL);
     } else if(!strcmp(modpblk.descr[i].name, "maxcachesize")) {
       runModConf->maxCacheSize = (int)pvals[i].val.d.n;
@@ -583,7 +586,7 @@ CODESTARTnewActInst
   CHKiRet(createInstance(&pData));
 
   // create the uid->gearInfo map
-  pData->uidMap = create_hashtable(runModConf->maxCacheSize, uidHash, uidKeyEquals, uidValueDestroy);
+  pData->uidMap = create_hashtable(runModConf->maxCacheSize, uidHash, uidKeyEquals, hashtable_freeGearInfo);
   if(NULL == pData->uidMap) {
     errmsg.LogError(0, RS_RET_ERR, "error: could not create uidMap, cannot activate action");
     ABORT_FINALIZE(RS_RET_ERR);
@@ -597,6 +600,7 @@ CODESTARTnewActInst
   }
 
   CHKmalloc(pData->sentinel = MALLOC(sizeof(gearInfo)));
+  pData->sentinel->gearUuid = NULL;
   pData->sentinel->prev = pData->sentinel;
   pData->sentinel->next = pData->sentinel;
 
@@ -681,6 +685,7 @@ static char* readOpenShiftEnvVar(char* gearBaseDir, char* gearUuid, char* varNam
 
   // no longer needed, so free it
   free(filename);
+  filename = NULL;
 
   // add space for \0
   size++;
@@ -773,7 +778,7 @@ CODESTARTdoAction
       }
 
       gearUuid = pwdata.pw_name;
-      gear->gearUuid = gearUuid;
+      gear->gearUuid = strdup(gearUuid);
 
       for(i = 0; i < runModConf->metadataCount; i++) {
         //NOTE: readOpenShiftEnvVar returns memory that was malloc'd
@@ -812,9 +817,6 @@ CODESTARTdoAction
 
       // delete the oldest entry if necessary
       if(gearToDelete != NULL) {
-        gearToDelete->prev->next = gearToDelete->next;
-        gearToDelete->next->prev = gearToDelete->prev;
-
         DBGPRINTF("mmopenshift: removing %s from uuid map\n", gearToDelete->gearUuid);
         uid_t* uidToDelete = hashtable_remove(pData->uuidMap, gearToDelete->gearUuid);
         if(uidToDelete != NULL) {
@@ -822,20 +824,14 @@ CODESTARTdoAction
           void* deleted = hashtable_remove(pData->uidMap, uidToDelete);
           if (deleted != NULL) {
             DBGPRINTF("mmopenshift: found key in map\n");
-            if(gearToDelete->metadata) {
-              hashtable_destroy(gearToDelete->metadata, 1);
-              gearToDelete->metadata = NULL;
-
-              // this was freed when the hashtable values were freed
-              gearToDelete->gearUuid = NULL;
-            }
           } else {
             DBGPRINTF("mmopenshift: unable to find %d in uid map\n", *uidToDelete);
           }
 
           free(uidToDelete);
           uidToDelete = NULL;
-          free(gearToDelete);
+
+          freeGearInfo(gearToDelete);
           gearToDelete = NULL;
         }
 
