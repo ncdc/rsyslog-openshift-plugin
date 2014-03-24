@@ -175,6 +175,8 @@ uidValueDestroy(void* value) {
       hashtable_destroy(gi->metadata, 1);
       gi->metadata = NULL;
     }
+    gi->prev->next = gi->next;
+    gi->next->prev = gi->prev;
     free(gi);
   }
 }
@@ -236,6 +238,8 @@ CODESTARTdbgPrintInstInfo
       gi = (gearInfo*)hashtable_iterator_value(iter);
       //DBGPRINTF("\t\tuid=%d app=%s gear=%s ns=%s\n", *(uid_t*)hashtable_iterator_key(iter), gi->appUuid, gi->gearUuid, gi->namespace);
     } while(hashtable_iterator_advance(iter));
+    free(iter);
+    iter = NULL;
   }
   if(pData->uuidMap != NULL && hashtable_count(pData->uuidMap) > 0) {
     DBGPRINTF("\tuuidMap:\n");
@@ -243,6 +247,8 @@ CODESTARTdbgPrintInstInfo
     do {
       DBGPRINTF("\t\tuuid=%s uid=%d\n", (char*)hashtable_iterator_key(iter), *(uid_t*)hashtable_iterator_value(iter));
     } while(hashtable_iterator_advance(iter));
+    free(iter);
+    iter = NULL;
   }
 ENDdbgPrintInstInfo
 
@@ -279,6 +285,17 @@ CODESTARTfreeInstance
   }
 
   //TODO free the entire linked list
+  if(pData->sentinel != NULL) {
+    while(pData->sentinel->next != pData->sentinel) {
+      gearInfo* toDelete = pData->sentinel->next;
+      toDelete->prev->next = toDelete->next;
+      toDelete->next->prev = toDelete->prev;
+      free(toDelete);
+      toDelete = NULL;
+    }
+    free(pData->sentinel);
+    pData->sentinel = NULL;
+  }
 
   // unlock the mutex
   pthread_mutex_unlock(&pData->lock);
