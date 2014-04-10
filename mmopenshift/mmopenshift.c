@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <sys/inotify.h>
 #include <pthread.h>
+#include <libestr.h>
 #include "conf.h"
 #include "syslogd-types.h"
 #include "srUtils.h"
@@ -53,6 +54,9 @@ DEF_OMOD_STATIC_DATA
 extern int Debug;
 
 /* module global variables */
+#define BANG_UID "!uid"
+#define OPENSHIFT_SECRET_TOKEN "OPENSHIFT_SECRET_TOKEN"
+
 static es_str_t* uidProperty = NULL;
 
 
@@ -215,10 +219,6 @@ static int
 stringKeyEquals(void *key1, void *key2)
 {
   return !strcmp((char*)key1, (char*)key2);
-}
-
-
-static void dbgPrintGearInfo(gearInfo* gi) {
 }
 
 
@@ -518,7 +518,8 @@ ENDendCnfLoad
 
 BEGINsetModCnf
   struct cnfparamvals *pvals;
-  unsigned int i, j;
+  unsigned int i;
+  int j;
 CODESTARTsetModCnf
   setModuleParamDefaults();
 
@@ -547,9 +548,34 @@ CODESTARTsetModCnf
       runModConf->maxCacheSize = (int)pvals[i].val.d.n;
     } else if(!strcmp(modpblk.descr[i].name, "metadata")) {
       runModConf->metadataCount = pvals[i].val.d.ar->nmemb;
-      CHKmalloc(runModConf->metadataNames = MALLOC(runModConf->metadataCount * sizeof(char *)));
-      for(j = 0; j < runModConf->metadataCount; j++) {
-        runModConf->metadataNames[j] = es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+
+      int secretTokenIndex = -1;
+
+      // loop through once to search for OPENSHIFT_SECRET_TOKEN
+      for(j = 0; j < (int)runModConf->metadataCount; j++) {
+        if(es_strconstcmp(pvals[i].val.d.ar->arr[j], OPENSHIFT_SECRET_TOKEN) == 0) {
+          // make sure OPENSHIFT_SECRET_TOKEN is excluded
+          secretTokenIndex = j;
+        }
+      }
+
+      if(secretTokenIndex > -1) {
+        // make sure OPENSHIFT_SECRET_TOKEN is excluded
+        runModConf->metadataCount--;
+      }
+
+      if(runModConf->metadataCount > 0) {
+        // allocate memory for the metadataNames
+        CHKmalloc(runModConf->metadataNames = MALLOC(runModConf->metadataCount * sizeof(char *)));
+
+        unsigned int namesIndex = 0;
+        // loop through again, copying into runModConf->metadataNames, excluding
+        // OPENSHIFT_SECRET_TOKEN
+        for(j = 0; j < pvals[i].val.d.ar->nmemb; j++) {
+          if(j != secretTokenIndex) {
+            runModConf->metadataNames[namesIndex++] = es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+          }
+        }
       }
     } else {
       dbgprintf("mmopenshift: program error, non-handled "
@@ -936,5 +962,5 @@ CODEmodInit_QueryRegCFSLineHdlr
   CHKiRet(objUse(errmsg, CORE_COMPONENT));
 
   // initialize estring for !uid json path
-  uidProperty = es_newStrFromCStr("!uid", 4);
+  uidProperty = es_newStrFromCStr(BANG_UID, strlen(BANG_UID));
 ENDmodInit
